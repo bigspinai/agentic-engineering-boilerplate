@@ -66,21 +66,3 @@ The vendored Vercel skills under `.agents/skills/vercel/` are frozen-in-repo (ze
 These three fields — `minimumReleaseAge`, `trustPolicy`, `minimumReleaseAgeExclude` — are security-critical. **Do not edit them, and do not add packages to the exclude list, without explicit human approval.** If `pnpm install` blocks because a release is too new, revert the version bump and wait it out.
 
 **Exception — critical CVEs:** if a fix is <7 days old but addresses an actively exploited or CVSS ≥9 vulnerability, that's the one case to consider adding to `minimumReleaseAgeExclude`. Present the CVE, publish date, and risk-of-waiting first; never make this call autonomously.
-
-## Roadmap (what's coming)
-
-v1 deliberately ships with a small surface area so the agentic-engineering layer is clearly the differentiator. Each item below will land in a future version with its own post in the series, showing how to encode the relevant conventions as skills the reviewers can enforce:
-
-- Vitest + Testing Library (test coverage enforcement)
-- Playwright (E2E coverage for user-visible changes)
-- Clerk authentication (auth-check enforcement on new routes)
-- Drizzle ORM + database (service-layer access, RLS on new tables)
-- Sentry monitoring (instrumentation on new endpoints)
-- Lefthook git hooks (local-side feedback loop, complements CI)
-- Storybook, i18n, Arcjet, and more
-
-## Series link
-
-This repo is the reference for the **agentic engineering** series.
-
-- Post 1 — *Two AI agents read every PR*: TBD blog URL
