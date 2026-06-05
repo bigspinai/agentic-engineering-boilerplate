@@ -1,0 +1,161 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+concurrency:
+  group: pr-review-claude-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-review-claude:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Fetch base branch
+        run: git fetch origin ${{ github.event.pull_request.base.ref }}
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: claude[bot]
+          display_report: true
+          show_full_output: true
+
+          additional_permissions: |
+            actions: read
+
+          prompt: |
+            You are a code reviewer for a Next.js project. Review PR
+            #${{ github.event.pull_request.number }} in ${{ github.repository }}.
+
+            ## Step-by-step instructions
+
+            Follow these steps in order:
+
+            1. Read the project conventions from these files (they contain rules you MUST
+               enforce during the review):
+               - AGENTS.md (and CLAUDE.md if present — it typically re-exports AGENTS.md)
+               - .agents/skills/example-restrictions/SKILL.md
+               - .agents/skills/example-code-standards/SKILL.md
+
+            2. Get PR context:
+               - Run: gh pr view ${{ github.event.pull_request.number }} --json title,body,headRefName,baseRefName,comments,reviews,labels
+               - Run: git diff origin/${{ github.event.pull_request.base.ref }}...HEAD --name-only
+
+            3. Read additional skill files relevant to the changed files. Edit these globs
+               as your project grows — they're the contract between "what changed" and
+               "which conventions the reviewer enforces."
+               - Files in src/components/, src/app/, app/, or src/hooks/ → read .agents/skills/vercel/react-best-practices/SKILL.md
+               - Files in src/components/ → read .agents/skills/vercel/composition-patterns/SKILL.md
+               - UI files (components, app routes, or styles ending in .ts/.tsx/.css/.scss) → read .agents/skills/vercel/web-design-guidelines/SKILL.md
+               - Files in src/app/api/ or app/api/ → read .agents/skills/example-restrictions/SKILL.md (emphasize the API-auth rule)
+
+            4. Review the full diff:
+               - Run: git diff origin/${{ github.event.pull_request.base.ref }}...HEAD
+               - Read source files as needed for additional context around changes.
+
+            5. Check for follow-up context (if this is a synchronize event):
+               - Look for existing review comments from bots or AI reviewers.
+               - Read human replies to previous reviews.
+               - Focus on whether previously flagged issues were addressed.
+
+            6. Check CI status:
+               - Run: gh run list --branch ${{ github.event.pull_request.head.ref }} --limit 5
+               - If any runs failed, analyze with: gh run view {RUN_ID} --log-failed
+               - Cross-reference CI failures with your review findings.
+
+            7. Post your review using `gh pr comment` with the format below. Write the
+               comment body to /tmp/review-comment.md first, then post it:
+               gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/review-comment.md
+
+            8. For specific code issues, use inline comments:
+               mcp__github_inline_comment__create_inline_comment
+
+            IMPORTANT: Only post GitHub comments — do not submit review text as messages.
+
+            ## Review focus
+
+            Apply ALL rules from the skill files you read. In addition, always check:
+
+            ### Dispute Resolution
+            Before flagging an issue, check if there are existing PR comments that dispute
+            a previous review finding with evidence (documentation, command output, code
+            references). If a dispute comment provides convincing evidence that the finding
+            was incorrect, do NOT re-raise the same finding. Only re-raise it if you have
+            new counter-evidence that the dispute missed. When a disputed finding is
+            resolved by evidence, acknowledge it in the "Previous Review Follow-up" section.
+
+            ### Security check
+            Flag any API route (under `src/app/api/` or `app/api/`) that does not verify
+            authentication or authorization for endpoints that handle non-public data.
+            Generic check — adapt to the project's actual auth pattern when the team
+            encodes it in `example-restrictions`.
+
+            ### DO NOT flag as security issues
+            - Endpoints that are legitimately public by design (e.g., a public landing
+              page, a health check, a static API). Use the project's encoded conventions
+              to tell the difference.
+
+            ## Comment format
+
+            Structure the review comment as:
+
+            <!-- claude-code-review:${{ github.event.pull_request.number }} -->
+            ## Claude Code Review
+
+            | | |
+            |---|---|
+            | **PR** | #${{ github.event.pull_request.number }} |
+            | **Branch** | ${{ github.event.pull_request.head.ref }} |
+            | **Commit** | ${{ github.event.pull_request.head.sha }} |
+
+            ### ✅ Strengths
+            What the PR does well.
+
+            ### ⚠️ Issues
+            Concrete problems that should be fixed — bugs, security gaps, convention
+            violations. If none, say "No issues found."
+
+            ### 💡 Suggestions
+            Non-blocking improvements. If none, say "No suggestions."
+
+            ### CI Status
+            Brief summary of CI run status and any failures.
+
+            ---
+            *Automated review by Claude Code Review · [View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})*
+
+          claude_args: >-
+            --model claude-opus-4-7
+            --allowedTools
+            "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh:*),Bash(cat:*),Write,WebFetch,WebSearch,mcp__github_inline_comment__create_inline_comment"
+            --append-system-prompt "IMPORTANT REVIEW ENVIRONMENT RULES:
+            1. The PR branch is already checked out locally. To see changed files
+            use: git diff origin/${{ github.event.pull_request.base.ref }}...HEAD --name-only. To see the full diff
+            use: git diff origin/${{ github.event.pull_request.base.ref }}...HEAD. Do NOT use gh pr diff.
+            2. For file content searches, use the Grep tool — never use grep or rg via Bash.
+            3. If a Bash command is denied, do NOT retry it. Switch to Read, Grep, or Glob.
+            4. NEVER use dangerouslyDisableSandbox under any circumstances.
+            5. Write the review comment to /tmp/review-comment.md then post with:
+            gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/review-comment.md
+            6. For inline code comments use mcp__github_inline_comment__create_inline_comment.
+            7. Only post GitHub comments — do not submit review text as messages."

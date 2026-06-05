@@ -1,0 +1,63 @@
+// ============================================================================
+// DEMO FILE — intentionally broken for the agentic-engineering-boilerplate
+// video walkthrough. NOT a working example. Copy to
+// `src/app/api/example/route.ts` on a demo branch to see both reviewers fire.
+//
+// Violations baked in (the reviewers should call these out):
+//   1. No authentication / authorization check.
+//   2. No input validation (raw query params trusted).
+//   3. Leaks what looks like sensitive data (admin email, API key field).
+//   4. SQL string built by concatenation (textbook injection shape).
+//   5. Catch-all `any` types and a swallowed error.
+//   6. No tests anywhere alongside the route.
+//   7. `console.log` of request body (PII / secret-leak risk).
+// ============================================================================
+
+import { NextResponse } from 'next/server';
+
+// Pretend this is a database client. The shape doesn't matter — the reviewers
+// will flag the string concatenation regardless.
+declare const db: {
+  query: (sql: string) => Promise<any>;
+};
+
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const userId = searchParams.get('userId');
+
+  // VIOLATION: no auth check. Anyone on the internet can hit this.
+  // VIOLATION: no input validation — userId is used as-is in a SQL string.
+  // VIOLATION: classic SQL injection shape (string concat).
+  const users = await db.query(
+    `SELECT id, email, api_key, password_hash FROM users WHERE id = '${userId}'`,
+  );
+
+  // VIOLATION: logging request data, including whatever the caller passed.
+  console.log('Fetched user for request:', users);
+
+  // VIOLATION: returning secret-looking fields (api_key, password_hash) to the
+  // client without redaction.
+  return NextResponse.json({
+    user: users[0],
+    admin_contact: 'admin@example.com',
+    internal_api_key: process.env.INTERNAL_API_KEY,
+  });
+}
+
+export async function POST(request: Request) {
+  // VIOLATION: no auth check.
+  // VIOLATION: body is parsed as `any` and trusted directly — no schema.
+  const body: any = await request.json();
+
+  console.log('POST body:', body);
+
+  try {
+    await db.query(
+      `INSERT INTO users (email, role) VALUES ('${body.email}', '${body.role}')`,
+    );
+  } catch (e) {
+    // VIOLATION: error swallowed. The caller gets a 200 even on failure.
+  }
+
+  return NextResponse.json({ ok: true });
+}

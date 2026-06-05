@@ -1,0 +1,670 @@
+name: AI Code Review with Codex
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+concurrency:
+  group: pr-review-codex-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-review-codex:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      actions: read
+    outputs:
+      final_message: ${{ steps.run_codex.outputs.final-message }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Explicitly check out the PR's merge commit.
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+
+      - name: Pre-fetch base and head refs for the PR
+        id: prefetch
+        run: |
+          git fetch --no-tags origin \
+            ${{ github.event.pull_request.base.ref }} \
+            +refs/pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr-head
+
+          MERGE_BASE=$(git merge-base origin/${{ github.event.pull_request.base.ref }} origin/pr-head)
+          echo "merge_base=$MERGE_BASE" >> "$GITHUB_OUTPUT"
+          echo "Merge base: $MERGE_BASE"
+
+          git diff "$MERGE_BASE"...origin/pr-head > /tmp/pr-changes.diff
+          echo "PR diff written to /tmp/pr-changes.diff ($(wc -l < /tmp/pr-changes.diff) lines)"
+
+      - name: Detect changed files and map to relevant skills
+        id: skills
+        run: |
+          # Get the list of files changed in this PR
+          CHANGED_FILES=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }}...origin/pr-head)
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          # Always-on skills (loaded for every review)
+          SKILLS="example-restrictions example-code-standards pr-loop"
+
+          # Map changed file paths to additional relevant skills.
+          # Edit these globs as your project grows — they're the contract between
+          # "what changed" and "which conventions the reviewer enforces."
+
+          # Changes under src/components/, app/, or src/hooks/ → React + Next.js best practices
+          if echo "$CHANGED_FILES" | grep -qE "^(src/components/|src/app/|app/|src/hooks/)"; then
+            SKILLS="$SKILLS vercel/react-best-practices"
+          fi
+          # Changes under src/components/ → composition patterns
+          if echo "$CHANGED_FILES" | grep -q "^src/components/"; then
+            SKILLS="$SKILLS vercel/composition-patterns"
+          fi
+          # UI changes (components, app routes, styles) → web design guidelines
+          if echo "$CHANGED_FILES" | grep -qE "^(src/components/|src/app/|app/).*\.(tsx?|css|scss)$"; then
+            SKILLS="$SKILLS vercel/web-design-guidelines"
+          fi
+          # API routes — emphasize the auth restriction
+          if echo "$CHANGED_FILES" | grep -qE "^(src/app/api/|app/api/)"; then
+            SKILLS="$SKILLS example-restrictions"
+          fi
+
+          # Deduplicate and build file paths
+          SKILL_PATHS=""
+          for skill in $(echo "$SKILLS" | tr ' ' '\n' | sort -u); do
+            SKILL_PATHS="${SKILL_PATHS} .agents/skills/${skill}/SKILL.md"
+          done
+          SKILL_PATHS=$(echo "$SKILL_PATHS" | xargs)
+
+          echo "Resolved skill paths: $SKILL_PATHS"
+          echo "skill_paths=$SKILL_PATHS" >> "$GITHUB_OUTPUT"
+
+          {
+            echo 'changed_files<<CHANGED_FILES_EOF'
+            echo "$CHANGED_FILES"
+            echo 'CHANGED_FILES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fetch previous review context
+        id: prev_review
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const prNumber = context.payload.pull_request.number;
+
+            // Fetch all issue comments with pagination
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+
+            // Find the last AI review comment
+            const aiReviews = comments.filter(c =>
+              c.body.includes('AI Code Review') && c.user.type === 'Bot'
+            );
+            const lastAiReview = aiReviews[aiReviews.length - 1];
+
+            let contextStr = '';
+            let isFollowup = false;
+
+            if (lastAiReview) {
+              isFollowup = true;
+              const lastReviewTime = new Date(lastAiReview.created_at);
+
+              // Find human replies after the last AI review
+              const humanReplies = comments.filter(c =>
+                c.user.type !== 'Bot' &&
+                new Date(c.created_at) > lastReviewTime
+              );
+
+              if (humanReplies.length > 0) {
+                contextStr += '### Human Replies to Previous Review\n\n';
+                for (const reply of humanReplies) {
+                  contextStr += `**@${reply.user.login}** (${reply.created_at}):\n${reply.body}\n\n`;
+                }
+              }
+
+              // Fetch all inline review comments with pagination
+              const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                per_page: 100,
+              });
+
+              const humanInlineReplies = reviewComments.filter(c =>
+                c.user.type !== 'Bot' &&
+                new Date(c.created_at) > lastReviewTime
+              );
+
+              if (humanInlineReplies.length > 0) {
+                contextStr += '### Human Replies to Inline Comments\n\n';
+                for (const reply of humanInlineReplies) {
+                  contextStr += `**@${reply.user.login}** on \`${reply.path}:${reply.line || reply.original_line}\`:\n${reply.body}\n\n`;
+                }
+              }
+            }
+
+            core.setOutput('context', contextStr);
+            core.setOutput('is_followup', String(isFollowup));
+
+      - name: Fetch CI status and logs
+        id: ci_status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+
+          CI_STATUS=$(gh run list --branch "$BRANCH" --limit 5 --json name,status,conclusion,databaseId 2>/dev/null || echo "[]")
+          echo "CI runs: $CI_STATUS"
+
+          FAILED_LOGS=""
+          for RUN_ID in $(echo "$CI_STATUS" | jq -r '.[] | select(.conclusion == "failure") | .databaseId'); do
+            FAILED_LOGS="${FAILED_LOGS}--- Failed run ${RUN_ID} ---"$'\n'
+            FAILED_LOGS="${FAILED_LOGS}$(gh run view "$RUN_ID" --log-failed 2>/dev/null | tail -c 20000)"$'\n\n'
+          done
+
+          {
+            echo 'ci_status<<CI_STATUS_EOF_7a3b2c'
+            echo "$CI_STATUS"
+            echo 'CI_STATUS_EOF_7a3b2c'
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo 'failed_logs<<FAILED_LOGS_EOF_7a3b2c'
+            echo "$FAILED_LOGS"
+            echo 'FAILED_LOGS_EOF_7a3b2c'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fetch linked issues
+        id: linked_issues
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const prBody = context.payload.pull_request.body || '';
+
+            // Parse issue references from PR body
+            const issuePattern = /(?:closes|fixes|resolves|close|fix|resolve)\s+#(\d+)/gi;
+            const issueNumbers = [];
+            let match;
+            while ((match = issuePattern.exec(prBody)) !== null) {
+              issueNumbers.push(parseInt(match[1]));
+            }
+
+            // Also check for bare #N references
+            const barePattern = /#(\d+)/g;
+            while ((match = barePattern.exec(prBody)) !== null) {
+              const num = parseInt(match[1]);
+              if (!issueNumbers.includes(num)) {
+                issueNumbers.push(num);
+              }
+            }
+
+            let contextStr = '';
+
+            for (const issueNum of issueNumbers.slice(0, 5)) {
+              try {
+                const { data: issue } = await github.rest.issues.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNum,
+                });
+
+                // Skip if this is actually a PR, not an issue
+                if (issue.pull_request) continue;
+
+                contextStr += `### Issue #${issueNum}: ${issue.title}\n`;
+                contextStr += `State: ${issue.state} | Labels: ${issue.labels.map(l => l.name).join(', ') || 'none'}\n`;
+                if (issue.body) {
+                  contextStr += `\n${issue.body.substring(0, 2000)}\n`;
+                }
+
+                // Fetch sub-issues if available (via timeline events)
+                try {
+                  const { data: timeline } = await github.rest.issues.listEventsForTimeline({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issueNum,
+                  });
+                  const crossRefs = timeline.filter(e =>
+                    e.event === 'cross-referenced' && e.source && e.source.issue
+                  );
+                  if (crossRefs.length > 0) {
+                    contextStr += '\nRelated issues:\n';
+                    for (const ref of crossRefs.slice(0, 5)) {
+                      contextStr += `- #${ref.source.issue.number}: ${ref.source.issue.title} (${ref.source.issue.state})\n`;
+                    }
+                  }
+                } catch (e) {
+                  // Timeline API may not be available, skip
+                }
+
+                contextStr += '\n';
+              } catch (e) {
+                console.log(`Could not fetch issue #${issueNum}: ${e.message}`);
+              }
+            }
+
+            core.setOutput('context', contextStr);
+
+      - name: Build review prompt
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          GH_TOKEN: ${{ github.token }}
+          PREV_REVIEW_CONTEXT: ${{ steps.prev_review.outputs.context }}
+          IS_FOLLOWUP: ${{ steps.prev_review.outputs.is_followup }}
+          CI_STATUS: ${{ steps.ci_status.outputs.ci_status }}
+          FAILED_LOGS: ${{ steps.ci_status.outputs.failed_logs }}
+          LINKED_ISSUES: ${{ steps.linked_issues.outputs.context }}
+        run: |
+          SKILL_PATHS="${{ steps.skills.outputs.skill_paths }}"
+
+          # Build the skill file list for the prompt
+          SKILL_FILE_LIST=""
+          for path in $SKILL_PATHS; do
+            SKILL_FILE_LIST="${SKILL_FILE_LIST}   - ${path}"$'\n'
+          done
+
+          MERGE_BASE="${{ steps.prefetch.outputs.merge_base }}"
+          CHANGED_FILES_LIST="${{ steps.skills.outputs.changed_files }}"
+
+          # Write the prompt to a temp file, then load into GITHUB_ENV
+          cat > /tmp/codex-prompt.txt <<PROMPT_END
+          This is PR #${{ github.event.pull_request.number }} for ${{ github.repository }}.
+          Merge-base SHA: ${MERGE_BASE}
+          Head SHA: ${{ github.event.pull_request.head.sha }}
+
+          ## CRITICAL: How to View the PR Diff
+
+          The PR diff has been pre-computed at \`/tmp/pr-changes.diff\`. To see ONLY the
+          changes introduced by this PR, run:
+            cat /tmp/pr-changes.diff
+          Or equivalently:
+            git diff ${MERGE_BASE}...origin/pr-head
+
+          Do NOT use \`${{ github.event.pull_request.base.sha }}\` (the base branch tip) for
+          diffing. The PR branch may be behind the base branch, and a two-dot diff against
+          the branch tip would show unrelated changes from the base branch as reversions.
+
+          ## Files Changed in This PR
+
+          ONLY these files were changed -- do not comment on any other files:
+          ${CHANGED_FILES_LIST}
+
+          You are reviewing code for a Next.js application. Apply the project's conventions
+          as encoded in the skill files listed below.
+
+          ## IMPORTANT: Read Project Conventions Before Reviewing
+
+          Before reviewing the PR changes, you MUST read the following files from the
+          repository. These contain the project's canonical conventions, restrictions, and
+          coding standards. Evaluate ALL changes in this PR against the rules described in
+          these files.
+
+          ### 1. Always-applied rules
+          Read: \`AGENTS.md\` (and \`CLAUDE.md\` if present — it typically re-exports \`AGENTS.md\`)
+
+          ### 2. Skill files (read ALL of these)
+          ${SKILL_FILE_LIST}
+
+          The skill files contain detailed rules for architecture, code quality, security,
+          API patterns, UI components, accessibility, and more. Apply every rule you find
+          in those files when reviewing the PR.
+
+          ## Security check
+          Flag any API route (under \`src/app/api/\` or \`app/api/\`) that does not verify
+          authentication or authorization for endpoints that handle non-public data.
+          Generic check — adapt to the boilerplate user's actual auth pattern when they
+          encode it in \`example-restrictions\`.
+
+          ## Output Format Requirements
+
+          Structure your response in the following JSON format:
+
+          \`\`\`json
+          {
+            "inline_comments": [
+              {
+                "path": "relative/path/to/file.ts",
+                "line": 42,
+                "body": "Specific feedback for this line"
+              }
+            ],
+            "strengths": "What the PR does well — good patterns, clean code, solid testing, etc. Use bullet points.",
+            "issues": "Concrete problems that should be fixed — bugs, security gaps, convention violations, etc. Use bullet points. If none, say 'No issues found.'",
+            "suggestions": "Non-blocking improvements — refactoring ideas, performance tips, readability tweaks. Use bullet points. If none, say 'No suggestions.'",
+            "additional_notes": "Anything else worth mentioning — context for future readers, follow-up work, broader implications. Use bullet points. If none, omit or say 'None.'",
+            "haiku": "A haiku (5-7-5) reflecting something you are proud of in the review work you just did. What craftsmanship did you show? How is the world a tiny bit better?",
+            "letter_to_predecessors": "A short (1 paragraph), sometimes humorous sometimes acerbic sometimes both, letter starting with 'Dear people who were here before me,' channeling any frustration or judgment about the codebase, instructions, patterns, or experience of doing this review. Like the unsent letter you write just to get feelings out."
+          }
+          \`\`\`
+
+          The \`haiku\` and \`letter_to_predecessors\` fields are purely fun commentary and MUST NOT
+          influence your actual review above. They are appended after the review content.
+
+          Review ONLY the changes introduced by the PR.
+          For inline comments, reference specific line numbers and file paths when you have concerns.
+
+          **CRITICAL CHECKS**:
+          - Flag any API endpoints that lack appropriate authentication or authorization
+            for non-public data (see Security check above).
+          - Flag violations of the conventions described in the skill files you read.
+
+          **DO NOT FLAG** as security issues:
+          - Endpoints that are legitimately public by design (e.g., a public landing page,
+            a health check, a static API). Use the project's encoded conventions to tell
+            the difference.
+
+          ## Dispute Resolution
+
+          Before flagging an issue, check if there are existing PR comments that dispute
+          a previous review finding with evidence (documentation, command output, code
+          references). If a dispute comment provides convincing evidence that the finding
+          was incorrect, do NOT re-raise the same finding. Only re-raise it if you have
+          new counter-evidence that the dispute missed.
+
+          Provide actionable feedback and highlight any violations of the project's
+          conventions. Be concise but thorough in your analysis.
+
+          Pull request title and body:
+          ----
+          PROMPT_END
+
+          # Append PR title and body safely from env vars (avoids shell injection)
+          echo "$PR_TITLE" >> /tmp/codex-prompt.txt
+          echo "$PR_BODY" >> /tmp/codex-prompt.txt
+
+          # Append previous review context (sourced from env vars to avoid shell injection)
+          if [ -n "$PREV_REVIEW_CONTEXT" ]; then
+            cat >> /tmp/codex-prompt.txt <<'PREV_REVIEW_END'
+
+          ## Previous Review Context
+
+          PREV_REVIEW_END
+            echo "$PREV_REVIEW_CONTEXT" >> /tmp/codex-prompt.txt
+          fi
+
+          # Append CI status
+          if [ -n "$CI_STATUS" ] && [ "$CI_STATUS" != "[]" ]; then
+            cat >> /tmp/codex-prompt.txt <<'CI_STATUS_END'
+
+          ## CI Status
+
+          CI_STATUS_END
+            echo '```json' >> /tmp/codex-prompt.txt
+            echo "$CI_STATUS" >> /tmp/codex-prompt.txt
+            echo '```' >> /tmp/codex-prompt.txt
+          fi
+
+          if [ -n "$FAILED_LOGS" ]; then
+            cat >> /tmp/codex-prompt.txt <<'FAILED_LOGS_END'
+
+          ### CI Failure Logs
+
+          Analyze these logs and cross-reference with your code review findings:
+
+          FAILED_LOGS_END
+            echo '```' >> /tmp/codex-prompt.txt
+            echo "$FAILED_LOGS" >> /tmp/codex-prompt.txt
+            echo '```' >> /tmp/codex-prompt.txt
+          fi
+
+          # Append linked issues context
+          if [ -n "$LINKED_ISSUES" ]; then
+            cat >> /tmp/codex-prompt.txt <<'LINKED_ISSUES_END'
+
+          ## Linked Issues
+
+          LINKED_ISSUES_END
+            echo "$LINKED_ISSUES" >> /tmp/codex-prompt.txt
+          fi
+
+          # Append follow-up instructions if this is a follow-up review
+          if [ "$IS_FOLLOWUP" = "true" ]; then
+            cat >> /tmp/codex-prompt.txt <<'FOLLOWUP_END'
+
+          ## Follow-Up Review Instructions
+
+          This is a follow-up review (new commits pushed to an existing PR).
+          Previous AI review comments exist. Please:
+          1. Reference previous review feedback shown in the Previous Review Context above.
+          2. Focus on whether previously flagged issues were addressed in the new changes.
+          3. Note any new issues introduced by the latest changes.
+          4. When discussing resolved items, reference the previous comment for continuity.
+          5. Acknowledge items that were properly addressed.
+
+          FOLLOWUP_END
+          fi
+
+          # Set the prompt as a multiline env var for subsequent steps
+          {
+            echo 'CODEX_PROMPT<<CODEX_PROMPT_DELIMITER_7f3a9b2e'
+            cat /tmp/codex-prompt.txt
+            echo 'CODEX_PROMPT_DELIMITER_7f3a9b2e'
+          } >> "$GITHUB_ENV"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.19.0
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Codex Review
+        id: run_codex
+        uses: openai/codex-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          safety-strategy: unsafe
+          model: gpt-5-codex
+          prompt: ${{ env.CODEX_PROMPT }}
+          allow-bots: true
+
+  post_feedback:
+    runs-on: ubuntu-latest
+    needs: pr-review-codex
+    if: needs.pr-review-codex.outputs.final_message != ''
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Post inline comments and summary
+        uses: actions/github-script@v7
+        env:
+          CODEX_FINAL_MESSAGE: ${{ needs.pr-review-codex.outputs.final_message }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const message = process.env.CODEX_FINAL_MESSAGE;
+
+            let reviewData;
+            try {
+              // Try to parse JSON response
+              const jsonMatch = message.match(/```json\s*(\{[\s\S]*?\})\s*```/);
+              if (jsonMatch) {
+                reviewData = JSON.parse(jsonMatch[1]);
+              } else {
+                // Fallback: try to parse the entire message as JSON
+                reviewData = JSON.parse(message);
+              }
+            } catch (error) {
+              console.log("Could not parse JSON, posting as plain summary:", error);
+              // Fallback to plain text summary
+              reviewData = {
+                inline_comments: [],
+                summary: message
+              };
+            }
+
+            // Get PR files to validate paths and line numbers
+            const { data: files } = await github.rest.pulls.listFiles({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+            });
+
+            // Create a review with inline comments
+            const reviewComments = [];
+            const failedComments = [];
+
+            if (reviewData.inline_comments && reviewData.inline_comments.length > 0) {
+              for (const comment of reviewData.inline_comments) {
+                // Find the file in the PR
+                const file = files.find(f => f.filename === comment.path);
+                if (!file || !comment.line || !file.patch) {
+                  console.log(`Skipping comment for ${comment.path}: file not found or no patch`);
+                  failedComments.push(comment);
+                  continue;
+                }
+
+                try {
+                  // Parse the diff to find valid positions for comments
+                  const patchLines = file.patch.split('\n');
+                  const validPositions = [];
+                  let rightLineNumber = 0;
+                  let position = 0;
+
+                  for (let i = 0; i < patchLines.length; i++) {
+                    const line = patchLines[i];
+                    position++;
+
+                    if (line.startsWith('@@')) {
+                      // Parse hunk header to get starting line number for new file
+                      const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+                      if (match) {
+                        rightLineNumber = parseInt(match[1]) - 1;
+                      }
+                      continue;
+                    }
+
+                    if (line.startsWith('+') || line.startsWith(' ')) {
+                      // Lines in the new file (added or context)
+                      rightLineNumber++;
+                      validPositions.push({
+                        lineNumber: rightLineNumber,
+                        position: position
+                      });
+                    } else if (line.startsWith('-')) {
+                      // Deleted lines don't increment the right line number
+                      // but they do count for position
+                      continue;
+                    }
+                  }
+
+                  // Find the exact line or closest valid position
+                  let bestMatch = validPositions.find(p => p.lineNumber === comment.line);
+
+                  if (!bestMatch) {
+                    // Find closest line if exact match not found
+                    let minDistance = Infinity;
+                    for (const pos of validPositions) {
+                      const distance = Math.abs(pos.lineNumber - comment.line);
+                      if (distance < minDistance) {
+                        minDistance = distance;
+                        bestMatch = pos;
+                      }
+                    }
+                  }
+
+                  if (bestMatch && bestMatch.position <= patchLines.length) {
+                    const isExactMatch = bestMatch.lineNumber === comment.line;
+                    const adjustedBody = isExactMatch
+                      ? comment.body
+                      : `(Originally line ${comment.line}, commenting on line ${bestMatch.lineNumber}) ${comment.body}`;
+
+                    reviewComments.push({
+                      path: comment.path,
+                      body: adjustedBody,
+                      position: bestMatch.position
+                    });
+                  } else {
+                    console.log(`No valid position found for comment on ${comment.path}:${comment.line}`);
+                    failedComments.push(comment);
+                  }
+                } catch (error) {
+                  console.log(`Error processing comment for ${comment.path}:${comment.line}:`, error);
+                  failedComments.push(comment);
+                }
+              }
+            }
+
+            // Try to create the review with inline comments
+            let reviewCreated = false;
+            if (reviewComments.length > 0) {
+              try {
+                await github.rest.pulls.createReview({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: context.payload.pull_request.number,
+                  body: "AI Code Review\n\nI've reviewed the changes and added inline comments below. Please see the summary comment for an overview.",
+                  event: "COMMENT",
+                  comments: reviewComments
+                });
+                reviewCreated = true;
+                console.log(`Successfully created review with ${reviewComments.length} inline comments`);
+              } catch (error) {
+                console.log("Failed to create review with inline comments:", error);
+                console.log("Will include failed comments in summary instead");
+              }
+            }
+
+            // Build structured summary from sections
+            const sections = [];
+
+            if (reviewData.strengths) {
+              sections.push("### ✅ Strengths\n\n" + reviewData.strengths);
+            }
+            if (reviewData.issues) {
+              sections.push("### ⚠️ Issues Found\n\n" + reviewData.issues);
+            }
+            if (reviewData.suggestions) {
+              sections.push("### 💡 Suggestions\n\n" + reviewData.suggestions);
+            }
+            if (reviewData.additional_notes) {
+              sections.push("### 📝 Additional Notes\n\n" + reviewData.additional_notes);
+            }
+
+            let summaryBody = sections.length > 0
+              ? sections.join("\n\n")
+              : (reviewData.summary || message);
+
+            if (failedComments.length > 0) {
+              summaryBody += "\n\n### Additional Comments\n\n";
+              summaryBody += "The following comments couldn't be posted inline due to diff positioning issues:\n\n";
+
+              for (const comment of failedComments) {
+                summaryBody += `**${comment.path}:${comment.line}**\n${comment.body}\n\n`;
+              }
+            }
+
+            if (reviewData.haiku) {
+              summaryBody += "\n\n---\n\n### 🏔️ Haiku\n\n" + reviewData.haiku;
+            }
+            if (reviewData.letter_to_predecessors) {
+              summaryBody += "\n\n### 📨 Dear Previous Developers\n\n" + reviewData.letter_to_predecessors;
+            }
+
+            const reviewComment = "## 🤖 AI Code Review Summary\n\n" + summaryBody + "\n\n---\n*This review was generated by Codex AI. Please use your judgment when addressing the feedback.*";
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: reviewComment,
+            });

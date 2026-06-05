@@ -1,0 +1,44 @@
+# =====================================================================
+# Supply chain attack mitigation — DO NOT BYPASS
+# =====================================================================
+#
+# This file enforces a one-week quarantine on freshly published packages.
+# Why this matters:
+#   - Real-world npm malware (Shai-Hulud v1/v2, the 2025 axios hijack,
+#     LiteLLM trojan, etc.) is typically detected and pulled from the
+#     registry within 24-48 hours of publication.
+#   - A 7-day delay puts almost all known supply chain attacks safely
+#     in the rear-view mirror by the time `pnpm install` would pick
+#     them up.
+#
+# The three security-critical knobs below — minimumReleaseAge,
+# trustPolicy, and minimumReleaseAgeExclude — are a HARD LINE.
+# Do NOT modify them without explicit human approval. If a fresh
+# release breaks your install, revert the version bump and wait;
+# do not bypass the guard.
+#
+# Requires pnpm 10.16+ (which introduced minimumReleaseAge).
+# =====================================================================
+
+# Wait 1 week (10080 minutes) before installing newly published versions.
+minimumReleaseAge: 10080
+
+# Refuse to install a package whose trust level has DECREASED — e.g.
+# a package that used to ship from a trusted publisher and now ships
+# with no provenance. This is the primary signal of an account takeover.
+trustPolicy: no-downgrade
+
+# Narrow allow-list of packages permitted to bypass the release-age delay.
+# Every entry needs a documented reason. Keep this list small.
+minimumReleaseAgeExclude:
+  - '@rollup/*'
+  - ajv
+  - minimatch
+  - rollup
+
+# create-next-app default — packages whose postinstall scripts should
+# be skipped (sharp / unrs-resolver). Unrelated to the supply chain guard
+# above; consolidated here so one file owns all pnpm config.
+ignoredBuiltDependencies:
+  - sharp
+  - unrs-resolver
