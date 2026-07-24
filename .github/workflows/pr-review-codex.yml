@@ -472,7 +472,7 @@ jobs:
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           safety-strategy: unsafe
-          model: gpt-5-codex
+          model: gpt-5.6-sol
           prompt: ${{ env.CODEX_PROMPT }}
           allow-bots: true
 
