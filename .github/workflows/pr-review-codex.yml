@@ -450,7 +450,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 10.19.0
           run_install: false
@@ -466,7 +466,7 @@ jobs:
 
       - name: Run Codex Review
         id: run_codex
-        uses: openai/codex-action@v1
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1.13
         env:
           GH_TOKEN: ${{ github.token }}
         with:
